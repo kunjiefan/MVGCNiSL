@@ -3,6 +3,8 @@
 
 
 ## run the model
-`python main.py`
-By default, the model runs on the 'K562' cell line using all five graph features and four types of omics features as the input.
+```
+python main.py
+```
+By default, the model runs on the 'K562' cell line using all five graph features and four types of omics features as the input.      
 Please refer to "main.py" for a list of parameters to be adjusted.

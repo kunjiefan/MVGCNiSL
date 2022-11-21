@@ -34,14 +34,14 @@ def init_argparse():
     parser.add_argument('--model', type=str, default="GCN_pool", help="model type")
     parser.add_argument('--pooling', type=str, default="max", help="type of pooling operations")
     parser.add_argument('--LR', type=float, default=0.0001, help="learning rate")
-    parser.add_argument('--epochs', type=int, default=800, help="number of maximum training epochs")
+    parser.add_argument('--epochs', type=int, default=500, help="number of maximum training epochs")
     parser.add_argument('--batch_size', type=int, default=512, help="batch size")
     parser.add_argument('--out_channels', type=int, default=64, help="dimension of output channels")
     parser.add_argument('--patience', type=int, default=150, help="patience in early stopping")
     parser.add_argument('--training_percent', type=float, default=0.70, help="proportion of the SL data as training set")
     
     parser.add_argument('--save_results', type=int, default=1, help="whether to save test results into json")
-    parser.add_argument('--split_method', type=str, default="novel_gene", help="how to split data into train, val and test")
+    parser.add_argument('--split_method', type=str, default="novel_pair", help="how to split data into train, val and test")
     parser.add_argument('--predict_novel_genes', type=int, default=0, help="whether to predict on novel out of samples")
     parser.add_argument('--novel_cellline', type=str, default="Jurkat", help="name of novel celllines")
 

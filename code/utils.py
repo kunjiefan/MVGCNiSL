@@ -13,6 +13,7 @@ from sklearn.preprocessing import scale
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from networkx.generators.random_graphs import fast_gnp_random_graph,gnp_random_graph
+from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score, precision_score, recall_score, f1_score
 
 
 def generate_unique_samples(cell_name):
@@ -46,10 +47,19 @@ def generate_unique_samples(cell_name):
 
 
 def load_SL_data(cell_name, threshold=-3):
-    data = pd.read_csv("../data/{}_GI_scores.csv".format(cell_name))
-    data['label'] = data['GI_scores'] <= threshold
-    all_genes = set(np.unique(data['gene1'])) | set(np.unique(data['gene2']))
-    
+    if cell_name != "synlethdb":
+        data = pd.read_csv("../data/{}_GI_scores.csv".format(cell_name))
+        data['label'] = data['GI_scores'] <= threshold
+        all_genes = list(set(np.unique(data['gene1'])) | set(np.unique(data['gene2'])))
+    else:
+        data = pd.read_csv("../data/SynLethDB_SL.csv")
+        data.rename(columns={"gene_a.name":"gene1", "gene_b.name":"gene2"}, inplace=True)
+        data = data[["gene1","gene2"]]
+        data["label"] = 1
+        all_genes = list(set(np.unique(data['gene1'])) | set(np.unique(data['gene2'])))
+        # get sampled negative samples
+        neg_df = generate_random_negative_samples(data, coeff=10)
+        data = pd.concat([data, neg_df])
     return data, all_genes
 
 
@@ -71,6 +81,9 @@ def load_graph_data(graph_type):
         data_dup = data.reindex(columns=['gene2','gene1'])
         data_dup.columns = ['gene1','gene2']
         data = data.append(data_dup)
+    elif graph_type == "pathway":
+        data = pd.read_csv("../data/Opticon_networks.csv")
+        data.rename(columns={"Regulator":"gene1", "Target gene":"gene2"}, inplace=True)
     elif graph_type == 'co-exp' or graph_type == 'co-ess':
         if graph_type == 'co-exp':
             data = pd.read_csv("../data/coexpression_exp_0.5.csv")
@@ -103,7 +116,6 @@ def load_graph_data(graph_type):
     return data
 
 
-
 def choose_node_attribute(attr, gene_mapping, cell_name, graph_data):
     num_nodes = len(gene_mapping)
     if attr == "identity":
@@ -127,6 +139,27 @@ def choose_node_attribute(attr, gene_mapping, cell_name, graph_data):
                 row_idx = gene_mapping[key]
                 x[row_idx, col_idx] = value
         # standardize features
+        x = scale(x)
+    elif attr == "CCLE_ess" or attr == "CCLE_exp":
+        dim = 64
+        df = pd.read_csv("../data/CCLE/{}.csv".format(attr), index_col=0)
+        df.fillna(0, inplace=True)
+        df.columns = list(map(lambda x:x.split(" ")[0], df.columns))
+        
+        df = df.T
+        all_genes = list(df.index)
+
+        # perform PCA for dimension reduction
+        values = df.values
+        pca = PCA(n_components=dim)
+        pca.fit(values)
+        embed = pca.transform(values)
+        embed_df = pd.DataFrame(embed, index=all_genes)
+
+        x = np.zeros((num_nodes, dim))
+        for gene, idx in gene_mapping.items():
+            if gene in all_genes:
+                x[idx] = embed_df.loc[gene]
         x = scale(x)
     elif attr == 'node2vec':
         # need to first build a torch data
@@ -214,7 +247,7 @@ def merge_and_mapping(SL_data, graph_data_list, SL_genes):
     # use the union of SL genes and graph genes as all genes
     temp_concat_graph_data = pd.concat(graph_data_list)
     graph_genes = set(temp_concat_graph_data['gene1'].unique()) | set(temp_concat_graph_data['gene2'].unique())
-    all_genes = sorted(list(SL_genes | graph_genes))
+    all_genes = sorted(list(set(SL_genes) | graph_genes))
 
     gene_mapping = dict(zip(all_genes, range(len(all_genes))))
 
@@ -229,22 +262,43 @@ def merge_and_mapping(SL_data, graph_data_list, SL_genes):
 
     return SL_data, graph_data_list, gene_mapping
 
-
     
-def generate_torch_geo_data(cell_name, CCLE_feats_flag, CCLE_hidden_dim, node2vec_feats_flag, threshold, graph_input, attr, predict_novel_flag, training_percent):
+def generate_torch_geo_data(cell_name, CCLE_feats_flag, CCLE_hidden_dim, node2vec_feats_flag, threshold, graph_input, attr, split_method, predict_novel_flag, training_percent):
     # load data
     SL_data, SL_genes = load_SL_data(cell_name, threshold)
     
     # generate SL torch data, split into train, valid, test
-    all_idx = list(range(len(SL_data)))
     np.random.seed(5959)
-    np.random.shuffle(all_idx)
+    if split_method == "novel_gene":
+        # only use pairwise combinations of selected genes as the training samples
+        # all other samples can be validation samples
+        np.random.shuffle(SL_genes)
+        training_genes = SL_genes[:int(len(SL_genes)*training_percent)]
+        val_genes = SL_genes[int(len(SL_genes)*training_percent):int(len(SL_genes)*(training_percent+0.1))]
+        test_genes = SL_genes[int(len(SL_genes)*(training_percent+0.1)):]
+        print("#####################################")
+        print("Number of genes in train, val and test:", len(training_genes), len(val_genes), len(test_genes))
+        print("#####################################")
+    elif split_method == "novel_pair":
+        all_idx = list(range(len(SL_data)))
+        np.random.shuffle(all_idx)
     
+    # load graph data
     graph_data_list = []
+    # get cell-specific expression values to filter unexpressed genes in the network
+    # remove genes whose expression raw count == 0
+    if cell_name != "synlethdb":
+        exp_df = pd.read_table("../data/cellline_feats/{}_exp.txt".format(cell_name),names=['gene','value'], sep=' ')
+        exp_df_filtered = exp_df[exp_df["value"]>0]
+        kept_genes = exp_df_filtered["gene"].values
+
     for graph_type in graph_input:
         if graph_type == "SL":
             # use training part of SL data to construct input graph
-            graph_data = SL_data.iloc[all_idx[:int(len(all_idx)*training_percent)]]
+            if split_method == "novel_gene":
+                graph_data = SL_data[(SL_data['gene1'].isin(training_genes))&(SL_data['gene2'].isin(training_genes))]
+            elif split_method == "novel_pair":
+                graph_data = SL_data.iloc[all_idx[:int(len(all_idx)*training_percent)]]
             graph_data = graph_data[graph_data['label']==True]
             graph_data = graph_data[['gene1','gene2']]
         elif graph_type == "PPI-genetic":
@@ -255,8 +309,12 @@ def generate_torch_geo_data(cell_name, CCLE_feats_flag, CCLE_hidden_dim, node2ve
             graph_list = [tuple(r) for r in graph_data[['gene1','gene2']].to_numpy()]
             left = list(set(graph_list) - set(SL_pos_list))
             graph_data = pd.DataFrame(left, columns=['gene1','gene2'])
+            if cell_name != "synlethdb":
+                graph_data = graph_data[(graph_data["gene1"].isin(kept_genes))&(graph_data["gene2"].isin(kept_genes))]
         else:
             graph_data = load_graph_data(graph_type)
+            if cell_name != "synlethdb":
+                graph_data = graph_data[(graph_data["gene1"].isin(kept_genes))&(graph_data["gene2"].isin(kept_genes))]
         
         graph_data_list.append(graph_data)
         
@@ -284,9 +342,26 @@ def generate_torch_geo_data(cell_name, CCLE_feats_flag, CCLE_hidden_dim, node2ve
         
     data = Data(x=data_x, edge_index_list=data_edge_index_list)
     
-    SL_data_train = SL_data.iloc[all_idx[:int(len(all_idx)*training_percent)]]
-    SL_data_val = SL_data.iloc[all_idx[int(len(all_idx)*training_percent):int(len(all_idx)*(training_percent+0.1))]]
-    SL_data_test = SL_data.iloc[all_idx[int(len(all_idx)*(training_percent+0.1)):]]
+    if split_method == "novel_gene":
+        training_genes = list(map(gene_mapping.get, training_genes))
+        val_genes = list(map(gene_mapping.get, val_genes))
+        test_genes = list(map(gene_mapping.get, test_genes))
+        SL_data_train = SL_data[(SL_data['gene1'].isin(training_genes))&(SL_data['gene2'].isin(training_genes))]
+        SL_data_val = SL_data[(SL_data['gene1'].isin(val_genes))&(SL_data['gene2'].isin(val_genes))]
+        SL_data_test = SL_data[(SL_data['gene1'].isin(test_genes))&(SL_data['gene2'].isin(test_genes))]
+    elif split_method == "novel_pair":
+        SL_data_train = SL_data.iloc[all_idx[:int(len(all_idx)*training_percent)]]
+        SL_data_val = SL_data.iloc[all_idx[int(len(all_idx)*training_percent):int(len(all_idx)*(training_percent+0.1))]]
+        SL_data_test = SL_data.iloc[all_idx[int(len(all_idx)*(training_percent+0.1)):]]
+    
+    # print info
+    num_pos_train = SL_data_train[SL_data_train["label"]==True].shape[0]
+    num_pos_val = SL_data_val[SL_data_val["label"]==True].shape[0]
+    num_pos_test = SL_data_test[SL_data_test["label"]==True].shape[0]
+    print("#####################################")
+    print("Number of positive samples in train, val and test:", num_pos_train, num_pos_val, num_pos_test)
+    print("#####################################")
+    
     
     # generate out of sample new prediction samples
     if predict_novel_flag:
@@ -312,8 +387,8 @@ def generate_torch_edges(df, balanced_sample, duplicate, device):
     else:
         df_neg = df[df['label'] == False]
     
-    pos_edge_idx = torch.tensor([df_pos['gene1'].values, df_pos['gene2'].values], dtype=torch.long, device=device)
-    neg_edge_idx = torch.tensor([df_neg['gene1'].values, df_neg['gene2'].values], dtype=torch.long, device=device)
+    #pos_edge_idx = torch.tensor([df_pos['gene1'].values, df_pos['gene2'].values], dtype=torch.long, device=device)
+    #neg_edge_idx = torch.tensor([df_neg['gene1'].values, df_neg['gene2'].values], dtype=torch.long, device=device)
 
     if duplicate == True:
         pos_edge_idx = torch.tensor([np.concatenate((df_pos['gene1'].values, df_pos['gene2'].values)),
@@ -332,7 +407,6 @@ def get_link_labels(pos_edge_index, neg_edge_index, device):
     link_labels = torch.zeros(num_links, dtype=torch.float, device=device)
     link_labels[:pos_edge_index.size(1)] = 1.
     return link_labels
-    
     
 def calculate_coexpression(data_type, rho_thres):
     df = pd.read_csv("../data/CCLE/CCLE_{}.csv".format(data_type), index_col=0)
@@ -357,13 +431,25 @@ def calculate_coexpression(data_type, rho_thres):
     plt.xlim(-1,1)
     plt.savefig("hist_rho_{}.png".format(data_type))
 
-
 def ranking_metrics(true_labels, pred_scores, top=0.05):
     sorted_index = np.argsort(-pred_scores)
     top_num = int(top * len(true_labels))
     sorted_true_labels = true_labels[sorted_index[:top_num]]
-    acc = float(sorted_true_labels.sum())/float(top_num)
+    if top_num == 0:
+        acc = 0
+    else:
+        acc = float(sorted_true_labels.sum())/float(top_num)
     return acc
+
+def evaluate_performance(label, pred):
+    AUC = roc_auc_score(label, pred)
+    AUPR = average_precision_score(label, pred)
+    rank_score_5 = ranking_metrics(label, pred, top=0.05)
+    rank_score_10 = ranking_metrics(label, pred, top=0.1)
+
+    performance_dict = {"AUC":AUC, "AUPR":AUPR, "precision@5":rank_score_5, "precision@10":rank_score_10}
+
+    return performance_dict
 
 def compute_fmax(true_labels, pred_scores):
     pred_scores = np.round(pred_scores, 2)
@@ -394,9 +480,10 @@ def compute_fmax(true_labels, pred_scores):
             t_max = threshold
     return f_max, p_max, r_max, t_max
 
-def generate_random_negative_samples(pos_samples):
-    # randomly generate same amount of negative samples as positive samples
-    num = pos_samples.shape[0]
+def generate_random_negative_samples(pos_samples, coeff=10):
+    # randomly generate same amount of negative samples as positive samples times coeff
+    # generate coeff times number of positive samples
+    num = pos_samples.shape[0] * coeff
     all_genes = list(set(pos_samples['gene1'].unique()) | set(pos_samples['gene2'].unique()))
     neg_candidates_1 = random.choices(all_genes, k=2*num)
     neg_candidates_2 = random.choices(all_genes, k=2*num)
@@ -407,5 +494,9 @@ def generate_random_negative_samples(pos_samples):
     remained_list = set(sampled_list) - set(pos_list)
     # remove gene pairs where gene1 = gene2
     remained_list = [x for x in remained_list if x[0] != x[1]]
+    remained_list = random.sample(remained_list, num)
     
-    return random.sample(remained_list, num)
+    neg_df = pd.DataFrame({"gene1":[x[0] for x in remained_list],
+                           "gene2":[x[1] for x in remained_list],
+                           "label":[0]*num})
+    return neg_df

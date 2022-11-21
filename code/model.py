@@ -25,8 +25,7 @@ class GCN_pool(torch.nn.Module):
         x = self.conv2(x, edge_index)
         return x
 
-    def decode(self, z, pos_edge_index, neg_edge_index):
-        edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=-1)
+    def decode(self, z, edge_index):
         x = torch.cat((z[edge_index[0]],z[edge_index[1]]),dim=1)
         x = self.fc1(x).relu()
         x = self.dropout(x)
